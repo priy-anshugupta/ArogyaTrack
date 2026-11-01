@@ -1,0 +1,25 @@
+Django>=4.2,<5.0
+gunicorn>=21.2
+psycopg2-binary>=2.9
+dj-database-url>=2.0
+celery>=5.3
+redis>=5.0
+djangorestframework>=3.14
+djangorestframework-simplejwt>=5.3
+django-cors-headers>=4.3
+python-dotenv>=1.0
+qrcode[pil]>=7.4
+PyJWT>=2.8
+django-ratelimit>=4.1
+reportlab>=4.0
+uharfbuzz>=0.39  # text shaping for Indian scripts in generated PDFs
+# ML dependencies
+numpy==2.2.6
+pandas==2.3.3
+scikit-learn==1.7.2
+prophet>=1.1
+xgboost==3.2.0
+joblib==1.6.0
+# Additional dependencies
+requests>=2.31
+openai>=1.0
