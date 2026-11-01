@@ -280,7 +280,7 @@ The system follows a layered architecture with clear separation of concerns:
 ## Project Structure
 
 ```
-algosmiths/
+ArogyaTrack/
 ├── backend/                    # Django REST API
 │   ├── accounts/               # Authentication, RBAC, audit logging
 │   ├── adherence/              # Medication adherence tracking
@@ -352,7 +352,7 @@ Ensure the following software is installed on your system:
 
 ```bash
 git clone <repository-url>
-cd algosmiths
+cd ArogyaTrack
 ```
 
 #### Create and Activate a Virtual Environment
@@ -715,6 +715,6 @@ All endpoints are prefixed with `/api/`. Authentication is required for most end
 
 <div align="center">
 
-**ArogyaTrack** — Built by **AlgoSmiths**
+**ArogyaTrack**
 
 </div>
