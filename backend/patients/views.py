@@ -1,0 +1,629 @@
+from django.utils import timezone
+from django.conf import settings
+from django.http import FileResponse, Http404
+from django.shortcuts import get_object_or_404
+from medical.models import DoctorPatientAccess
+from rest_framework import permissions, status
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+import jwt
+from django.db.models import Prefetch
+
+from .models import HealthCard, HealthCardService, Profile, PatientProfile
+from .serializers import (
+    HealthCardSerializer,
+    PatientProfileSerializer,
+    ProfileSerializer,
+    RevokeHealthCardSerializer,
+    SwitchProfileSerializer,
+)
+from medical.models import Allergy, ChronicCondition, MedicalRecord, PatientVisitRecord, HealthMetric
+from medical.serializers import (
+    MedicalHistorySerializer,
+    PatientVisitRecordSerializer,
+    AllergySerializer,
+    ChronicConditionSerializer,
+)
+from prescriptions.models import Prescription
+from prescriptions.serializers import PrescriptionSerializer
+
+
+class ActiveProfileView(APIView):
+    """Get or update the current user's active profile."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        profile = user.get_active_profile()
+        if not profile:
+            return Response({"detail": "No profile found. Please create a profile first."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(ProfileSerializer(profile).data)
+
+    def patch(self, request):
+        user = request.user
+        profile = user.get_active_profile()
+        if not profile:
+            return Response({"detail": "No profile found."}, status=status.HTTP_404_NOT_FOUND)
+        serializer = ProfileSerializer(profile, data=request.data, partial=True, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        profile = serializer.save()
+        return Response(ProfileSerializer(profile).data)
+
+
+class PatientProfileView(APIView):
+    """Get or update the patient-level profile data (consents, documents, etc.)."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    @staticmethod
+    def _get_profile(user):
+        # Patient accounts created before consent tracking (or by seed scripts)
+        # have no row yet; create one with every consent unset.
+        if user.role != "patient":
+            return None
+        return PatientProfile.objects.get_or_create(user=user)[0]
+
+    def get(self, request):
+        patient_profile = self._get_profile(request.user)
+        if patient_profile is None:
+            return Response({"detail": "Only patient accounts have a patient profile."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(PatientProfileSerializer(patient_profile).data)
+
+    def patch(self, request):
+        patient_profile = self._get_profile(request.user)
+        if patient_profile is None:
+            return Response({"detail": "Only patient accounts have a patient profile."}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = PatientProfileSerializer(
+            patient_profile, 
+            data=request.data, 
+            partial=True, 
+            context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        patient_profile = serializer.save()
+        return Response(PatientProfileSerializer(patient_profile).data)
+
+
+class CreateProfileView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = ProfileSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        profile = serializer.save()
+        return Response(ProfileSerializer(profile).data, status=status.HTTP_201_CREATED)
+
+
+class MyProfilesView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        qs = request.user.profiles.all()
+        data = ProfileSerializer(qs, many=True).data
+        return Response({"active_profile_id": request.user.active_profile_id, "profiles": data})
+
+
+class SwitchProfileView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def put(self, request):
+        serializer = SwitchProfileSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        profile = serializer.save()
+        return Response({"active_profile_id": str(profile.id)}, status=status.HTTP_200_OK)
+
+
+class HealthCardDownloadView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, profile_id):
+        profile = get_object_or_404(Profile, id=profile_id, user=request.user)
+        if not hasattr(profile, "health_card"):
+            raise Http404("Health card not found")
+        card = profile.health_card
+        if card.revoked_at is not None:
+            return Response({"detail": "Health card revoked"}, status=status.HTTP_410_GONE)
+        data = HealthCardSerializer(card).data
+        return Response({"token": data["token"], "qr_code_path": data["qr_code_path"], "expires_at": data["expires_at"]})
+
+
+class HealthCardImageView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, profile_id):
+        profile = get_object_or_404(Profile, id=profile_id, user=request.user)
+        if not hasattr(profile, "health_card"):
+            raise Http404("Health card not found")
+        card = profile.health_card
+        path = card.qr_code_path
+        try:
+            return FileResponse(open(path, "rb"), content_type="image/png")
+        except FileNotFoundError as exc:  # pragma: no cover
+            raise Http404("QR code not found") from exc
+
+
+class RevokeHealthCardView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, profile_id):
+        profile = get_object_or_404(Profile, id=profile_id, user=request.user)
+        serializer = RevokeHealthCardSerializer(data={}, context={"profile": profile})
+        serializer.is_valid(raise_exception=True)
+        card = serializer.save()
+        from accounts.audit import AuditService
+        AuditService.log_event(
+            event_type="health_card_revoked",
+            action="Patient reissued health card",
+            user=request.user,
+            resource_type="Profile",
+            resource_id=str(profile.id),
+        )
+        return Response({"revoked_at": card.revoked_at}, status=status.HTTP_200_OK)
+
+
+# ─── My Card endpoints (auto-resolve profile) ──────────────────────
+
+
+def _get_or_create_card(user):
+    """Get active profile and ensure a health card exists, creating one if needed."""
+    profile = user.get_active_profile()
+    if not profile:
+        return None, None
+
+    # Auto-generate health card if it doesn't exist
+    try:
+        card = profile.health_card
+        if card.revoked_at is not None:
+            card.delete()
+            raise HealthCard.DoesNotExist
+    except HealthCard.DoesNotExist:
+        card = HealthCardService.create_health_card(
+            profile=profile,
+            media_root=str(settings.MEDIA_ROOT)
+        )
+
+    return profile, card
+
+
+class MyHealthCardView(APIView):
+    """
+    Convenience endpoint: get (or auto-generate) the current user's active-profile
+    health card without needing to know its profile_id up front.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _respond(self, request):
+        profile, card = _get_or_create_card(request.user)
+        if not profile:
+            return Response(
+                {"detail": "No profile found. Please complete your profile first."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        if card.revoked_at is not None:
+            return Response({"detail": "Health card revoked"}, status=status.HTTP_410_GONE)
+        data = HealthCardSerializer(card).data
+        return Response({"token": data["token"], "qr_code_path": data["qr_code_path"], "expires_at": data["expires_at"]})
+
+    def get(self, request):
+        return self._respond(request)
+
+    def post(self, request):
+        return self._respond(request)
+
+
+class MyCardView(APIView):
+    """Return the logged-in patient's card data. Auto-generates if missing."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        profile, card = _get_or_create_card(request.user)
+        if not profile:
+            return Response(
+                {"detail": "No profile found. Please complete your profile first."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        unique_patient_id = profile.patient_id or "N/A"
+
+        qr_code_url = None
+        if card and card.qr_code_path:
+            # Convert absolute file path to relative media URL
+            import os
+            try:
+                # Check if file actually exists at the stored path
+                if not os.path.exists(card.qr_code_path):
+                    print(f"QR code file missing at: {card.qr_code_path}")
+                    raise FileNotFoundError(f"QR code file not found at {card.qr_code_path}")
+                
+                rel_path = os.path.relpath(card.qr_code_path, settings.MEDIA_ROOT)
+                media_url = settings.MEDIA_URL + rel_path.replace("\\", "/")
+                qr_code_url = request.build_absolute_uri(media_url)
+            except (ValueError, FileNotFoundError) as e:
+                # Path is on a different drive or file missing -> regenerate
+                print(f"Regenerating QR code due to error: {e}")
+                try:
+                    # Regenerate new QR code
+                    token = card.token
+                    # Ensure directory exists
+                    qr_dir = os.path.join(settings.MEDIA_ROOT, "qr_codes", "health_cards")
+                    os.makedirs(qr_dir, exist_ok=True)
+                    
+                    file_path = os.path.join(qr_dir, f"{profile.id}.png")
+                    
+                    # Call service to generate (re-using existing logic)
+                    HealthCardService.generate_qr_image(token, file_path)
+                    
+                    # Update card path
+                    card.qr_code_path = file_path
+                    card.save(update_fields=["qr_code_path"])
+                    
+                    # Now try again
+                    rel_path = os.path.relpath(card.qr_code_path, settings.MEDIA_ROOT)
+                    media_url = settings.MEDIA_URL + rel_path.replace("\\", "/")
+                    qr_code_url = request.build_absolute_uri(media_url)
+                    print(f"Regenerated QR code URL: {qr_code_url}")
+                except Exception as ex:
+                    # Failsafe: return proper error or fallback
+                    print(f"Failed to regenerate QR code path: {ex}")
+                    import traceback
+                    traceback.print_exc()
+                    qr_code_url = None
+        
+        profile_photo_url = None
+        if profile.profile_photo:
+            profile_photo_url = request.build_absolute_uri(profile.profile_photo.url)
+
+        return Response({
+            "unique_patient_id": unique_patient_id,
+            "name": profile.name,
+            "date_of_birth": str(profile.date_of_birth) if profile.date_of_birth else None,
+            "age": profile.age,
+            "blood_group": profile.blood_group,
+            "district": profile.district or "",
+            "gender": profile.gender,
+            "qr_code_url": qr_code_url,
+            "token": card.token if card else None,
+            "profile_photo_url": profile_photo_url,
+            "profile_id": str(profile.id),
+            "relationship": profile.relationship,
+            "phone": profile.phone or "",
+            "state": profile.state or "",
+            "issued_at": card.created_at if card else None,
+            "expires_at": card.expires_at if card else None,
+            "doctors_with_access": DoctorPatientAccess.objects.filter(
+                patient=profile, expires_at__gt=timezone.now()
+            ).values("doctor").distinct().count(),
+        })
+
+
+class MyCardPhotoUploadView(APIView):
+    """Upload profile photo for the patient card."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        profile, _ = _get_or_create_card(request.user)
+        if not profile:
+            return Response(
+                {"detail": "No profile found. Please complete your profile first."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        
+        photo = request.FILES.get('photo')
+        if not photo:
+            return Response(
+                {"detail": "No photo file provided."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        
+        # Validate file type
+        allowed_extensions = ['jpg', 'jpeg', 'png']
+        file_ext = photo.name.split('.')[-1].lower()
+        if file_ext not in allowed_extensions:
+            return Response(
+                {"detail": f"Invalid file type. Allowed: {', '.join(allowed_extensions)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        
+        # Validate file size (max 5MB)
+        max_size = 5 * 1024 * 1024  # 5MB in bytes
+        if photo.size > max_size:
+            return Response(
+                {"detail": "File too large. Maximum size is 5MB."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        
+        # Save the photo
+        profile.profile_photo = photo
+        profile.save()
+        
+        profile_photo_url = request.build_absolute_uri(profile.profile_photo.url)
+        
+        return Response({
+            "detail": "Profile photo uploaded successfully.",
+            "profile_photo_url": profile_photo_url,
+        }, status=status.HTTP_200_OK)
+
+
+class MyCardQRImageView(APIView):
+    """Return the QR code image for the logged-in patient."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        profile, card = _get_or_create_card(request.user)
+        if not profile or not card:
+            return Response({"detail": "No health card found."}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            return FileResponse(open(card.qr_code_path, "rb"), content_type="image/png")
+        except FileNotFoundError:
+            card.delete()
+            card = HealthCardService.create_health_card(profile=profile, media_root=str(settings.MEDIA_ROOT))
+            return FileResponse(open(card.qr_code_path, "rb"), content_type="image/png")
+
+
+class MyCardPDFView(APIView):
+    """Generate and return a PDF of the patient card."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        profile, card = _get_or_create_card(request.user)
+        if not profile or not card:
+            return Response({"detail": "No health card found."}, status=status.HTTP_404_NOT_FOUND)
+
+        from documents.pdfs import health_card_pdf
+        from documents.views import _log, _pdf_response
+
+        name = f"Health_card_{profile.patient_id or 'patient'}.pdf"
+        _log(request, "health_card", name)
+        return _pdf_response(health_card_pdf(profile, card), name, inline=request.query_params.get("inline") == "1")
+
+
+class ScanPatientQRView(APIView):
+    """
+    Verify a scanned QR code token and return patient information.
+    Only accessible by doctors and admins.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        import jwt as pyjwt
+
+        # Only approved doctors (and admins) may open patient history.
+        user = request.user
+        if not (user.is_admin or user.is_superuser or user.is_approved_doctor):
+            detail = (
+                "Your doctor account is pending approval. Patient records unlock once an administrator approves your licence."
+                if user.role == "doctor"
+                else "Only doctors and administrators can scan patient QR codes."
+            )
+            return Response({"detail": detail}, status=status.HTTP_403_FORBIDDEN)
+
+        token = request.data.get("token")
+        patient_id_input = request.data.get("patient_id")
+
+        if not token and not patient_id_input:
+            return Response(
+                {"detail": "QR token or Patient ID is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            optimized_qs = (
+                Profile.objects
+                .select_related("user", "health_card")
+                .prefetch_related(
+                    "medical_records__diagnoses",
+                    Prefetch("allergies", queryset=Allergy.objects.select_related("added_by")),
+                    Prefetch("chronic_conditions", queryset=ChronicCondition.objects.select_related("added_by")),
+                )
+            )
+
+            if patient_id_input:
+                # Typing an ID is only a shortcut back to patients this doctor
+                # already has consented access to; new patients must present
+                # their card, since holding the QR is how a patient consents.
+                profile = optimized_qs.get(patient_id=str(patient_id_input).strip().upper())
+                if not user.is_admin and not DoctorPatientAccess.objects.filter(
+                    doctor=user, patient=profile, expires_at__gt=timezone.now()
+                ).exists():
+                    return Response(
+                        {"detail": "Scan this patient's QR health card to get access. Manual ID lookup only works for patients you already have access to."},
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+            else:
+                # Decode the JWT token
+                try:
+                    payload = jwt.decode(
+                        token,
+                        settings.SIMPLE_JWT.get("SIGNING_KEY"),
+                        algorithms=[settings.SIMPLE_JWT.get("ALGORITHM", "HS256")],
+                    )
+                    patient_id = payload.get("patient_id")
+                    if not patient_id:
+                        raise jwt.InvalidTokenError("No patient_id in token")
+                    profile = optimized_qs.get(id=patient_id)
+                except (jwt.InvalidTokenError, Profile.DoesNotExist):
+                    # Fallback: look up health card by matching the raw token string
+                    try:
+                        card_match = HealthCard.objects.select_related("profile__user", "profile__health_card").get(token=token)
+                        if not card_match.is_active():
+                            return Response(
+                                {"detail": "This health card has expired or been revoked."},
+                                status=status.HTTP_410_GONE,
+                            )
+                        profile = card_match.profile
+                    except HealthCard.DoesNotExist:
+                        return Response(
+                            {"detail": "Invalid QR code."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+
+            card = getattr(profile, "health_card", None)
+            if card and not card.is_active():
+                return Response(
+                    {"detail": "This health card has expired or been revoked."},
+                    status=status.HTTP_410_GONE,
+                )
+            # A QR from a reissued (revoked) card still decodes to the same
+            # patient, so it must match the card that is live right now.
+            if token and not patient_id_input and (card is None or card.token != token):
+                return Response(
+                    {"detail": "This QR belongs to a card that has been replaced. Ask the patient for their current card."},
+                    status=status.HTTP_410_GONE,
+                )
+
+            access = None
+            if user.role == "doctor":
+                access = (
+                    DoctorPatientAccess.objects.filter(doctor=user, patient=profile, expires_at__gt=timezone.now())
+                    .order_by("-expires_at").first()
+                )
+                if token and not patient_id_input:
+                    from datetime import timedelta
+                    new_expiry = timezone.now() + timedelta(hours=24)
+                    if access is None:
+                        access = DoctorPatientAccess.objects.create(
+                            doctor=user, patient=profile, expires_at=new_expiry,
+                        )
+                    elif access.expires_at < new_expiry:
+                        access.expires_at = new_expiry
+                        access.save(update_fields=["expires_at"])
+                from accounts.audit import AuditService
+                AuditService.log_event(
+                    event_type="patient_record_accessed",
+                    action="Doctor opened patient history" + (" via QR scan" if token and not patient_id_input else " via patient ID"),
+                    user=user,
+                    resource_type="Profile",
+                    resource_id=str(profile.id),
+                    details={"access_method": "qr_scan" if token and not patient_id_input else "patient_id"},
+                )
+
+            unique_patient_id = profile.patient_id or "N/A"
+            profile_photo_url = (
+                request.build_absolute_uri(profile.profile_photo.url)
+                if profile.profile_photo
+                else None
+            )
+
+            # Batch remaining queries (visit records, prescriptions, vitals)
+            # These can't be prefetched on Profile but we minimize round-trips
+            medical_records = list(
+                profile.medical_records.order_by('-created_at')[:10]
+            )  # already prefetched with diagnoses
+
+            visit_records = list(
+                PatientVisitRecord.objects
+                .filter(profile=profile)
+                .order_by('-visit_date')[:10]
+            )
+
+            allergies = list(profile.allergies.all())  # already prefetched
+            chronic_conditions = list(
+                profile.chronic_conditions.filter(is_active=True)
+            )  # already prefetched (filtered in Python is fine for small sets)
+
+            prescriptions = list(
+                Prescription.objects
+                .filter(patient=profile)
+                .order_by('-created_at')[:10]
+            )
+
+            # Single query for both latest vitals (PostgreSQL DISTINCT ON)
+            latest_metrics = {
+                m.metric_type: m
+                for m in HealthMetric.objects
+                .filter(profile=profile, metric_type__in=['blood_pressure', 'sugar'])
+                .order_by('metric_type', '-recorded_at')
+                .distinct('metric_type')
+            }
+            bp_metric = latest_metrics.get('blood_pressure')
+            sugar_metric = latest_metrics.get('sugar')
+
+            # Build vitals dict
+            latest_vitals = {"blood_pressure": None, "blood_sugar": None}
+
+            if bp_metric:
+                systolic = bp_metric.value
+                diastolic = bp_metric.secondary_value
+                bp_status = "normal"
+                if systolic >= 140 or (diastolic and diastolic >= 90):
+                    bp_status = "high"
+                elif systolic < 90 or (diastolic and diastolic < 60):
+                    bp_status = "low"
+                latest_vitals["blood_pressure"] = {
+                    "value": f"{int(systolic)}/{int(diastolic) if diastolic else '?'}",
+                    "systolic": systolic,
+                    "diastolic": diastolic,
+                    "unit": bp_metric.unit,
+                    "status": bp_status,
+                    "recorded_at": bp_metric.recorded_at.isoformat(),
+                }
+
+            if sugar_metric:
+                val = sugar_metric.value
+                sugar_status = "normal"
+                if val >= 200:
+                    sugar_status = "high"
+                elif val < 70:
+                    sugar_status = "low"
+                latest_vitals["blood_sugar"] = {
+                    "value": val,
+                    "unit": sugar_metric.unit,
+                    "status": sugar_status,
+                    "recorded_at": sugar_metric.recorded_at.isoformat(),
+                }
+
+            # Serialize once
+            medical_records_data = MedicalHistorySerializer(medical_records, many=True).data
+            visit_records_data = PatientVisitRecordSerializer(
+                visit_records, many=True, context={'request': request}
+            ).data
+            allergies_data = AllergySerializer(allergies, many=True).data
+            chronic_conditions_data = ChronicConditionSerializer(chronic_conditions, many=True).data
+            prescriptions_data = PrescriptionSerializer(prescriptions, many=True).data
+
+            return Response({
+                "success": True,
+                "patient": {
+                    "id": str(profile.id),
+                    "unique_patient_id": unique_patient_id,
+                    "name": profile.name,
+                    "age": profile.age,
+                    "gender": profile.gender,
+                    "blood_group": profile.blood_group,
+                    "date_of_birth": str(profile.date_of_birth) if profile.date_of_birth else None,
+                    "phone": profile.phone or None,
+                    "address": profile.address or None,
+                    "district": profile.district or None,
+                    "state": profile.state or None,
+                    "pincode": profile.pincode or None,
+                    "profile_photo_url": profile_photo_url,
+                },
+                "card_info": {
+                    "issued_at": card.created_at.isoformat() if card else None,
+                    "expires_at": card.expires_at.isoformat() if card else None,
+                },
+                "access": {
+                    "expires_at": access.expires_at.isoformat() if access else None,
+                    "method": getattr(access, "access_method", None) if access else None,
+                },
+                "latest_vitals": latest_vitals,
+                "medical_records": medical_records_data,
+                "visit_records": visit_records_data,
+                "allergies": allergies_data,
+                "chronic_conditions": chronic_conditions_data,
+                "prescriptions": prescriptions_data,
+            })
+
+        except Profile.DoesNotExist:
+            return Response(
+                {"detail": "Patient not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        except Exception as e:
+            return Response(
+                {"detail": f"Error processing QR code: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
